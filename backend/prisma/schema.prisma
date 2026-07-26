@@ -210,6 +210,25 @@ model AdminAuditLog {
   @@map("admin_audit_logs")
 }
 
+/// Immutable audit trail for tenant configuration changes.
+/// Tracks who changed which tenant config key and when, including old/new values for forensics.
+/// Rows must never be updated or deleted — append-only.
+model TenantConfigAuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String   /// tenant identifier or 'default' for global config
+  actor     String   /// wallet address or email of the user who made the change
+  key       String   /// configuration key name (e.g. "solvency_buffer_threshold")
+  oldValue  String?  /// previous value (JSON-serialized, null if key was newly added)
+  newValue  String   /// new value (JSON-serialized)
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+  @@index([key])
+  @@index([actor])
+  @@map("tenant_config_audit_logs")
+}
+
 /// Runtime feature flags toggled by admin operators.
 model FeatureFlag {
   key         String   @id
@@ -292,11 +311,29 @@ model SupportTicket {
   createdAt        DateTime     @default(now())
   updatedAt        DateTime     @updatedAt
 
+  replies          SupportTicketReply[]
+
   @@index([status])
   @@index([assignedTo])
   @@index([createdAt])
   @@index([firstRespondedAt])
   @@map("support_tickets")
+}
+
+/// Customer or staff reply to a support ticket.
+model SupportTicketReply {
+  id        String   @id @default(uuid())
+  ticketId  String   @map("ticket_id")
+  message   String
+  /// 'customer' or 'staff'
+  author    String
+  createdAt DateTime @default(now())
+
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([createdAt])
+  @@map("support_ticket_replies")
 }
 
 /// Privacy-safe FAQ expansion counters.
@@ -421,7 +458,7 @@ model RegisteredVoter {
 
 /// Off-chain profile for a wallet holder. Created on first authenticated GET /profile.
 model HolderProfile {
-  walletAddress         String   @id @map("wallet_address")
+  walletAddress         String   @id @unique @map("wallet_address")
   displayName           String?  @map("display_name")
   /// Stored as-is; anonymized by the privacy service on request.
   email                 String?
@@ -457,4 +494,53 @@ enum PostStatus {
   DRAFT
   PUBLISHED
   ARCHIVED
+}
+
+/// Tracks ramp transaction records received via webhooks for reconciliation.
+model RampTransaction {
+  id                String   @id @default(uuid())
+  purchaseId        String   @unique /// Ramp provider's purchase ID
+  status            String   /// COMPLETE, FAILED, REFUNDED
+  receiverAddress   String   @map("receiver_address")
+  cryptoAmount      String   @map("crypto_amount")
+  cryptoCurrency    String   @map("crypto_currency")
+  fiatValue         Decimal  @map("fiat_value")
+  fiatCurrency      String   @map("fiat_currency")
+  finalTxHash       String?  @map("final_tx_hash")
+  lastSyncedAt      DateTime @map("last_synced_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([receiverAddress])
+  @@index([lastSyncedAt])
+  @@map("ramp_transactions")
+}
+
+/// Tracks last-known health status of the ramp provider.
+model RampProviderHealth {
+  id                String   @id @default(uuid())
+  status            String   /// up, degraded, down
+  lastCheckedAt     DateTime @map("last_checked_at")
+  errorMessage      String?  @map("error_message")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("ramp_provider_health")
+}
+
+/// Immutable audit log for profile field-level changes.
+model ProfileAuditLog {
+  id                String   @id @default(uuid())
+  walletAddress     String   @map("wallet_address")
+  fieldName         String   @map("field_name")
+  oldValue          String?  @map("old_value")
+  newValue          String?  @map("new_value")
+  actor             String   /// wallet address or system identifier
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@index([walletAddress])
+  @@index([fieldName])
+  @@index([createdAt])
+  @@map("profile_audit_logs")
 }

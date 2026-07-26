@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import * as client from 'prom-client';
+import { MetricsCardinalityGuard } from './cardinality-guard.service';
 
 /**
  * MetricsService — single source of truth for all Prometheus metrics.
@@ -11,6 +12,8 @@ import * as client from 'prom-client';
  *                for the histogram; exact code for counters is fine because the
  *                set is bounded.
  *  - `rpc_method`: one of a fixed enum of Soroban RPC calls
+ *  - `claim_id`: bucketed to ranges (0-999, 1000-1999, ...) via cardinality guard
+ *  - `tenant`: normalized to hash or well-known ID via cardinality guard
  *
  * Extension point for OpenTelemetry:
  *  Replace the prom-client calls in recordHttpRequest / recordRpcCall with
@@ -20,6 +23,7 @@ import * as client from 'prom-client';
 @Injectable()
 export class MetricsService implements OnModuleInit {
   private readonly registry: client.Registry;
+  private readonly cardinalityGuard: MetricsCardinalityGuard;
 
   // ── HTTP metrics ──────────────────────────────────────────────────────────
   readonly httpRequestDuration: client.Histogram<string>;
@@ -32,7 +36,10 @@ export class MetricsService implements OnModuleInit {
   readonly dlqDepth: client.Gauge<string>;
   readonly dlqJobFailed: client.Counter<string>;
   readonly queueActiveWorkers: client.Gauge<string>;
+  readonly queueDepth: client.Gauge<string>;
   readonly bullmqJobRetriesTotal: client.Counter<string>;
+  readonly queueDepth: client.Gauge<string>;
+  readonly jobProcessingDuration: client.Histogram<string>;
 
   // ── Indexer / observability metrics ───────────────────────────────────────
   readonly indexerLag: client.Gauge<string>;
@@ -87,7 +94,8 @@ export class MetricsService implements OnModuleInit {
   /** Total mismatches found in a single reconciliation run. */
   readonly voteReconciliationMismatchCount: client.Counter<string>;
 
-  constructor() {
+  constructor(cardinalityGuard: MetricsCardinalityGuard) {
+    this.cardinalityGuard = cardinalityGuard;
     this.registry = new client.Registry();
     this.registry.setDefaultLabels({ app: 'niffyinsure-api' });
 
@@ -153,10 +161,32 @@ export class MetricsService implements OnModuleInit {
       registers: [this.registry],
     });
 
+    this.queueDepth = new client.Gauge({
+      name: 'bullmq_queue_depth',
+      help: 'Total number of pending jobs in a queue (waiting + active + delayed)',
+      labelNames: ['queue'],
+      registers: [this.registry],
+    });
+
     this.bullmqJobRetriesTotal = new client.Counter({
       name: 'bullmq_job_retries_total',
       help: 'Total job retry attempts per queue (excludes first attempt and final exhaustion)',
       labelNames: ['queue', 'job_name'],
+      registers: [this.registry],
+    });
+
+    this.queueDepth = new client.Gauge({
+      name: 'bullmq_queue_depth',
+      help: 'Number of jobs currently waiting to be processed in each queue',
+      labelNames: ['queue'],
+      registers: [this.registry],
+    });
+
+    this.jobProcessingDuration = new client.Histogram({
+      name: 'bullmq_job_processing_duration_seconds',
+      help: 'Job processing duration in seconds per queue',
+      labelNames: ['queue', 'job_name', 'status'],
+      buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 300],
       registers: [this.registry],
     });
 
@@ -383,12 +413,14 @@ export class MetricsService implements OnModuleInit {
   }
 
   recordSolvencyBuffer(opts: { tenant: string; bufferStroops: bigint }) {
-    this.solvencyBufferStroops.set({ tenant: opts.tenant }, Number(opts.bufferStroops));
+    const normalizedTenant = this.cardinalityGuard.normalizeTenantId(opts.tenant);
+    this.solvencyBufferStroops.set({ tenant: normalizedTenant }, Number(opts.bufferStroops));
   }
 
   recordSolvencyThreshold(opts: { tenant: string; thresholdStroops: bigint }) {
+    const normalizedTenant = this.cardinalityGuard.normalizeTenantId(opts.tenant);
     this.solvencyBufferThresholdStroops.set(
-      { tenant: opts.tenant },
+      { tenant: normalizedTenant },
       Number(opts.thresholdStroops),
     );
   }
@@ -422,7 +454,8 @@ export class MetricsService implements OnModuleInit {
     onChainApprove: number,
     onChainReject: number,
   ) {
-    this.voteTallyMismatches.inc({ claim_id: String(claimId) });
+    const normalizedClaimId = this.cardinalityGuard.normalizeClaimId(claimId);
+    this.voteTallyMismatches.inc({ claim_id: normalizedClaimId });
   }
 
   recordVoteReconciliationError() {
@@ -435,6 +468,14 @@ export class MetricsService implements OnModuleInit {
 
   recordJobRetry(opts: { queue: string; jobName: string }) {
     this.bullmqJobRetriesTotal.inc({ queue: opts.queue, job_name: opts.jobName });
+  }
+
+  recordQueueActiveWorkers(opts: { queue: string; count: number }) {
+    this.queueActiveWorkers.set({ queue: opts.queue }, opts.count);
+  }
+
+  recordQueueDepth(opts: { queue: string; depth: number }) {
+    this.queueDepth.set({ queue: opts.queue }, opts.depth);
   }
 
   async getMetrics(): Promise<string> {
